@@ -1,0 +1,6 @@
+selenium
+gspread
+oauth2client
+pandas
+beautifulsoup4
+webdriver-manager
