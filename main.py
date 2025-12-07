@@ -21,12 +21,20 @@ def get_sheet_data():
     return sheet
 
 # --- BROWSER SETUP ---
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.options import Options
+
 def get_driver():
     chrome_options = Options()
-    chrome_options.add_argument("--headless")  # Run without opening GUI (Required for GitHub Actions)
+    chrome_options.add_argument("--headless") 
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(options=chrome_options)
+    
+    # This automatically handles the driver installation
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
 
 # --- SCRAPING FUNCTIONS ---
