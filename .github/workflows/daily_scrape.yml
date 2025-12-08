@@ -1,15 +1,31 @@
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
+name: Daily Telco Scrape
 
-def get_driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless") 
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    
-    # This automatically handles the driver installation
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
+on:
+  schedule:
+    - cron: '0 19 * * *'  # Runs daily at 12:00 AM Pakistan Time (19:00 UTC)
+  workflow_dispatch:      # Allows you to click "Run workflow" manually to test
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Create Credentials File
+        # This takes the secret you saved and creates the actual file main.py needs
+        run: |
+          echo '${{ secrets.GDRIVE_API_CREDENTIALS }}' > service_account.json
+
+      - name: Run Scraper
+        run: python main.py
