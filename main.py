@@ -58,11 +58,8 @@ def scroll_to_bottom(driver):
         if new_height == last_height: break
         last_height = new_height
 
-# --- SMART PARSER (The Magic Part) ---
+# --- SMART PARSER ---
 def parse_offer_text(text_block):
-    """
-    Analyzes raw text to separate Name, Details, and Price intelligently.
-    """
     lines = [line.strip() for line in text_block.split('\n') if line.strip()]
     
     name = "Unknown Bundle"
@@ -71,24 +68,23 @@ def parse_offer_text(text_block):
     validity = "N/A"
 
     # Regex patterns
-    price_pattern = re.compile(r'(Rs\.|PKR|Consumer Price)', re.IGNORECASE)
+    price_pattern = re.compile(r'(Rs\.|PKR|Consumer Price|Incl\. Tax)', re.IGNORECASE)
     data_pattern = re.compile(r'(\d+\s*(GB|MB))', re.IGNORECASE)
     mins_pattern = re.compile(r'(\d+\s*Mins)', re.IGNORECASE)
     sms_pattern = re.compile(r'(\d+\s*SMS)', re.IGNORECASE)
     
-    # 1. Extract Price first (It's usually distinct)
+    # 1. Extract Price
     for i, line in enumerate(lines):
         if price_pattern.search(line):
-            # Extract just the number if possible
             price_match = re.search(r'[\d,]+', line)
             if price_match:
                 price = price_match.group(0)
             else:
-                price = line # Fallback to whole line
-            lines.pop(i) # Remove price line so it doesn't become name
+                price = line
+            lines.pop(i) 
             break
             
-    # 2. Extract Details (Data, Mins, SMS)
+    # 2. Extract Details & Validity
     filtered_lines = []
     for line in lines:
         is_detail = False
@@ -102,19 +98,20 @@ def parse_offer_text(text_block):
             details.append(line)
             is_detail = True
         
-        # Validity Logic
-        if "Weekly" in line: validity = "Weekly"
-        elif "Monthly" in line: validity = "Monthly"
-        elif "Daily" in line: validity = "Daily"
-        elif "3 Day" in line: validity = "3 Days"
+        # Validity Guessing
+        lower_line = line.lower()
+        if "weekly" in lower_line: validity = "Weekly"
+        elif "monthly" in lower_line: validity = "Monthly"
+        elif "daily" in lower_line: validity = "Daily"
+        elif "3 day" in lower_line: validity = "3 Days"
 
         if not is_detail:
             filtered_lines.append(line)
 
-    # 3. What's left is likely the Name
-    # We take the first line that isn't too long (names are usually short)
+    # 3. Name Extraction (First valid line remaining)
     for line in filtered_lines:
-        if len(line) > 3 and "Subscribe" not in line and "Consumer Price" not in line:
+        # Ignore common button texts
+        if len(line) > 3 and "subscribe" not in line.lower() and "consumer price" not in line.lower():
             name = line
             break
             
@@ -127,10 +124,11 @@ def scrape_zong(driver):
     print("🔹 Scraping Zong...")
     driver.get("https://www.zong.com.pk/prepaid")
     time.sleep(5)
+    scroll_to_bottom(driver) # Added scrolling for Zong!
     
     offers = []
     try:
-        # Find containers with "Consumer Price"
+        # Simplified Zong Selector
         cards = driver.find_elements(By.XPATH, "//*[contains(text(), 'Consumer Price')]/../../..")
         
         for card in cards:
@@ -147,30 +145,32 @@ def scrape_zong(driver):
 
 def scrape_jazz(driver):
     print("🔹 Scraping Jazz...")
-    driver.get("https://jazz.com.pk/prepaid/all-in-one-offers") # Direct link to All-in-one is better
+    driver.get("https://jazz.com.pk/prepaid/all-in-one-offers")
     time.sleep(5)
     scroll_to_bottom(driver)
     
     offers = []
     try:
-        # Case-insensitive search for "Subscribe" or "More Details"
-        # We look for the BUTTON, then go up to the CARD
-        xpath = "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'subscribe')]/../../.."
+        # FIXED JAZZ SELECTOR: Uses '.' to check current node and children text
+        # Checks for "SUBSCRIBE" or "MORE DETAILS"
+        xpath = "//button[contains(., 'SUBSCRIBE') or contains(., 'Subscribe') or contains(., 'MORE DETAILS') or contains(., 'More Details')]/../../.."
         cards = driver.find_elements(By.XPATH, xpath)
         
+        # Fallback if buttons aren't found, look for Prices
         if len(cards) == 0:
-            # Fallback: Try looking for "Rs." if buttons fail
+            print("   Using fallback selector for Jazz...")
             cards = driver.find_elements(By.XPATH, "//*[contains(text(), 'Rs.')]/../../..")
 
         for card in cards:
             try:
                 name, validity, details, price = parse_offer_text(card.text)
                 
-                # Jazz Validity often isn't in text, try to guess from Name
+                # Validity Fallback
                 if validity == "N/A":
-                    if "Weekly" in name: validity = "Weekly"
-                    elif "Monthly" in name: validity = "Monthly"
-                    elif "Daily" in name: validity = "Daily"
+                    lower_name = name.lower()
+                    if "weekly" in lower_name: validity = "Weekly"
+                    elif "monthly" in lower_name: validity = "Monthly"
+                    elif "daily" in lower_name: validity = "Daily"
 
                 offers.append(["Jazz", name, validity, details, price])
             except: continue
@@ -195,20 +195,17 @@ def process_data(new_data, sheet):
         remark = "New Offer"
         
         if not df_old.empty and 'Offer Name' in df_old.columns:
-            # Filter for this specific offer
             match = df_old[(df_old['Operator'] == operator) & (df_old['Offer Name'] == name)]
             
             if not match.empty:
-                # Get the last entry for this offer
                 last_entry = match.iloc[-1]
                 last_price = str(last_entry['Price']).strip()
                 last_details = str(last_entry['Details']).strip()
                 
-                # Compare Logic
                 price_changed = last_price != str(price).strip()
                 details_changed = last_details != str(details).strip()
                 
-                if not price_changed and not details_changed:
+                if not price_changed:
                     remark = "Same as yesterday"
                 else:
                     changes = []
