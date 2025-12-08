@@ -18,7 +18,7 @@ from datetime import datetime
 SHEET_NAME = "Telecom_Offers_Bot"  
 JSON_KEYFILE = "service_account.json"
 
-# --- SETUP GEMINI AI (UPDATED FOR YOUR MODELS) ---
+# --- SETUP GEMINI AI ---
 def setup_gemini():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -28,44 +28,42 @@ def setup_gemini():
     print("🔑 Configuring Gemini API...")
     genai.configure(api_key=api_key)
     
-    # 1. We prioritize the models we SAW in your logs
+    # CHANGED: We now prioritize 1.5 Flash because it has the best Free Tier limits
     priority_models = [
-        'gemini-2.0-flash',       # Newest & Fastest
-        'gemini-flash-latest',    # Always valid
-        'gemini-1.5-flash',       # Fallback
-        'gemini-pro'              # Old Reliable
+        'gemini-1.5-flash',       # STABLE & FREE (Best choice)
+        'gemini-1.5-pro',         # Good fallback
+        'gemini-flash-latest',    
+        'gemini-pro'              
     ]
     
     target_model_name = None
     try:
         print("🔎 Listing available models...")
-        available_models = [m.name for m in genai.list_models()]
+        # Get all models that support generating content
+        all_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         
-        # Check for our priority models first
+        # Check priority list
         for priority in priority_models:
-            for available in available_models:
-                if priority in available:
+            for available in all_models:
+                if priority in available and "exp" not in available: # Avoid experimental models if possible
                     target_model_name = available
                     break
             if target_model_name: break
         
-        # If we still don't have one, just grab the first "generateContent" model
-        if not target_model_name:
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    target_model_name = m.name
-                    break
+        # Fallback
+        if not target_model_name and all_models:
+            target_model_name = all_models[0]
 
         if target_model_name:
             print(f"👉 Selected Model: {target_model_name}")
             return genai.GenerativeModel(target_model_name)
         else:
-            print("⚠️ Could not auto-detect. Forcing 'gemini-2.0-flash'...")
-            return genai.GenerativeModel('gemini-2.0-flash')
+            print("⚠️ Could not auto-detect. Forcing 'gemini-1.5-flash'...")
+            return genai.GenerativeModel('gemini-1.5-flash')
             
     except Exception as e:
         print(f"❌ Error selecting model: {e}")
-        return genai.GenerativeModel('gemini-2.0-flash')
+        return genai.GenerativeModel('gemini-1.5-flash')
 
 # --- AUTHENTICATION ---
 def get_sheet_data():
@@ -92,20 +90,16 @@ def get_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
-    # Using a generic User-Agent to avoid detection
     chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=chrome_options)
 
 # --- HELPER: Scroll & Extract Text ---
 def get_page_content(driver, url):
-    # SAFETY: Remove any markdown brackets if they exist
+    # SAFETY: Remove any markdown brackets
     clean_url = url.replace("[", "").replace("]", "").split("(")[0].strip()
     if clean_url.startswith("http") and ")" in url:
-        # Fix specific markdown case [url](url) -> url
         clean_url = url.split("(")[-1].replace(")", "")
-    
-    # If the regex above failed, just force the raw string if it looks like a url
     if not clean_url.startswith("http"):
         clean_url = url.strip()
 
@@ -125,7 +119,7 @@ def get_page_content(driver, url):
     body_text = driver.find_element(By.TAG_NAME, "body").text
     return body_text
 
-# --- AI PARSER ---
+# --- AI PARSER (WITH RETRY LOGIC) ---
 def parse_with_gemini(model, operator_name, raw_text):
     print(f"🤖 Asking Gemini to extract {operator_name} offers...")
     
@@ -144,15 +138,27 @@ def parse_with_gemini(model, operator_name, raw_text):
     {raw_text[:30000]} 
     """
     
-    try:
-        response = model.generate_content(prompt)
-        cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(cleaned_text)
-        print(f"   ✅ Gemini found {len(data)} offers.")
-        return data
-    except Exception as e:
-        print(f"   ❌ Gemini Error: {e}")
-        return []
+    # Retry Loop: Tries 3 times if Quota Exceeded
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt)
+            cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(cleaned_text)
+            print(f"   ✅ Gemini found {len(data)} offers.")
+            return data
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "Quota exceeded" in error_msg:
+                wait_time = 20 # Wait 20 seconds
+                print(f"   ⚠️ Quota Hit! Waiting {wait_time}s before retry ({attempt+1}/{max_retries})...")
+                time.sleep(wait_time)
+            else:
+                print(f"   ❌ Gemini Error: {e}")
+                return []
+    
+    return []
 
 # --- MAIN EXECUTION ---
 def main():
@@ -170,18 +176,21 @@ def main():
     all_rows = []
     today = datetime.now().strftime("%Y-%m-%d")
     
-    # 2. Define Sites to Scrape
-    # (I have ensured these are plain strings now)
     sites = [
         {"name": "Zong", "url": "[https://www.zong.com.pk/prepaid](https://www.zong.com.pk/prepaid)"},
         {"name": "Jazz", "url": "[https://jazz.com.pk/prepaid/all-in-one-offers](https://jazz.com.pk/prepaid/all-in-one-offers)"},
     ]
 
-    # 3. Loop through sites
     for site in sites:
         try:
             print(f"🔹 Processing {site['name']}...")
             raw_text = get_page_content(driver, site['url'])
+            
+            # Helper to pause between sites to save quota
+            if len(all_rows) > 0: 
+                print("   Sleeping 10s to be safe...")
+                time.sleep(10)
+
             offers = parse_with_gemini(model, site['name'], raw_text)
             
             for offer in offers:
@@ -200,7 +209,6 @@ def main():
 
     driver.quit()
     
-    # 4. Save
     if all_rows:
         print(f"📝 Writing {len(all_rows)} rows to Google Sheets...")
         try:
