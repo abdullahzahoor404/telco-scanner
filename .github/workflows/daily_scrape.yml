@@ -2,8 +2,8 @@ name: Daily Telco Scrape
 
 on:
   schedule:
-    - cron: '0 19 * * *'  # Runs daily at 12:00 AM Pakistan Time (19:00 UTC)
-  workflow_dispatch:      # Allows you to click "Run workflow" manually to test
+    - cron: '0 19 * * *'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,10 +22,12 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Create Credentials File
-        # This takes the secret you saved and creates the actual file main.py needs
+      - name: Create Credentials File (Python Method)
+        env:
+          GDRIVE_CREDS: ${{ secrets.GDRIVE_API_CREDENTIALS }}
         run: |
-          echo '${{ secrets.GDRIVE_API_CREDENTIALS }}' > service_account.json
+          # We use python to dump the JSON to avoid shell quoting errors
+          python -c "import os, json; f = open('service_account.json', 'w'); json.dump(json.loads(os.environ['GDRIVE_CREDS']), f)"
 
       - name: Run Scraper
         run: python main.py
