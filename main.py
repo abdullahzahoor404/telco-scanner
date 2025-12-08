@@ -17,15 +17,41 @@ from datetime import datetime
 SHEET_NAME = "Telecom_Offers_Bot"  
 JSON_KEYFILE = "service_account.json"
 
-# --- SETUP GEMINI AI ---
+# --- SETUP GEMINI AI (SMART SELECTOR) ---
 def setup_gemini():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("❌ CRITICAL: GEMINI_API_KEY not found in secrets!")
         return None
+    
+    print("🔑 Configuring Gemini API...")
     genai.configure(api_key=api_key)
-    # Using 'gemini-1.5-flash' because it is fast, cheap/free, and smart enough
-    return genai.GenerativeModel('gemini-pro')
+    
+    # Dynamic Model Selection: Ask Google what is available
+    target_model_name = None
+    try:
+        print("🔎 Listing available models for your Key...")
+        for m in genai.list_models():
+            # We only care about models that can 'generateContent'
+            if 'generateContent' in m.supported_generation_methods:
+                print(f"   - Available: {m.name}")
+                # Prefer Flash (faster/free), then Pro
+                if 'gemini-1.5-flash' in m.name:
+                    target_model_name = m.name
+                elif 'gemini-1.5-pro' in m.name and not target_model_name:
+                    target_model_name = m.name
+        
+        if target_model_name:
+            print(f"👉 Automatically selected: {target_model_name}")
+            return genai.GenerativeModel(target_model_name)
+        else:
+            # Fallback if list fails but key works
+            print("⚠️ Could not auto-detect, forcing 'gemini-1.5-flash'...")
+            return genai.GenerativeModel('gemini-1.5-flash')
+            
+    except Exception as e:
+        print(f"❌ Error listing models: {e}")
+        return None
 
 # --- AUTHENTICATION ---
 def get_sheet_data():
@@ -60,18 +86,17 @@ def get_driver():
 def get_page_content(driver, url):
     print(f"   Navigating to {url}...")
     driver.get(url)
-    time.sleep(5) # Let initial load happen
+    time.sleep(5) 
     
     print("   Scrolling to load all offers...")
     last_height = driver.execute_script("return document.body.scrollHeight")
-    for i in range(5): # Scroll 5 times
+    for i in range(5):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(3)
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height: break
         last_height = new_height
         
-    # Get the visible text of the body. This is what humans see.
     body_text = driver.find_element(By.TAG_NAME, "body").text
     return body_text
 
@@ -79,7 +104,6 @@ def get_page_content(driver, url):
 def parse_with_gemini(model, operator_name, raw_text):
     print(f"🤖 Asking Gemini to extract {operator_name} offers...")
     
-    # The Prompt: We teach Gemini exactly how to format the data
     prompt = f"""
     You are a data extraction bot. I will give you the raw text from the {operator_name} website.
     Your job is to find all the Telecom Bundles/Offers in the text.
@@ -92,12 +116,11 @@ def parse_with_gemini(model, operator_name, raw_text):
     5. Do not add markdown formatting (like ```json). Just the raw JSON string.
     
     Here is the raw text:
-    {raw_text[:30000]}  # Limit text to avoid token limits, though 1.5 Flash handles huge context
+    {raw_text[:30000]} 
     """
     
     try:
         response = model.generate_content(prompt)
-        # Clean response (sometimes AI adds ```json at start)
         cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(cleaned_text)
         print(f"   ✅ Gemini found {len(data)} offers.")
@@ -113,18 +136,23 @@ def main():
     # 1. Setup
     model = setup_gemini()
     sheet = get_sheet_data()
-    if not model or not sheet: return
+    
+    # If model failed (key error) or sheet failed, stop.
+    if not model: 
+        print("❌ STOPPING: Gemini Model could not be loaded.")
+        return
+    if not sheet: 
+        print("❌ STOPPING: Google Sheet could not be loaded.")
+        return
 
     driver = get_driver()
     all_rows = []
     today = datetime.now().strftime("%Y-%m-%d")
     
     # 2. Define Sites to Scrape
-    # Add more sites here easily!
     sites = [
-        {"name": "Zong", "url": "https://www.zong.com.pk/prepaid"},
-        {"name": "Jazz", "url": "https://jazz.com.pk/prepaid/all-in-one-offers"},
-        {"name": "Telenor", "url": "https://www.telenor.com.pk/personal/telenor/offers/"},
+        {"name": "Zong", "url": "[https://www.zong.com.pk/prepaid](https://www.zong.com.pk/prepaid)"},
+        {"name": "Jazz", "url": "[https://jazz.com.pk/prepaid/all-in-one-offers](https://jazz.com.pk/prepaid/all-in-one-offers)"},
     ]
 
     # 3. Loop through sites
@@ -132,13 +160,9 @@ def main():
         try:
             print(f"🔹 Processing {site['name']}...")
             raw_text = get_page_content(driver, site['url'])
-            
-            # Send to AI
             offers = parse_with_gemini(model, site['name'], raw_text)
             
-            # Format for Sheets
             for offer in offers:
-                # Add "New Offer" logic here if you want (simplified for now)
                 all_rows.append([
                     today,
                     site['name'],
@@ -167,4 +191,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
