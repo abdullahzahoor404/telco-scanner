@@ -1,10 +1,10 @@
 import time
 import json
 import os
-import re
 import pandas as pd
 import gspread
 import traceback
+import google.generativeai as genai
 from google.oauth2.service_account import Credentials
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -17,9 +17,19 @@ from datetime import datetime
 SHEET_NAME = "Telecom_Offers_Bot"  
 JSON_KEYFILE = "service_account.json"
 
+# --- SETUP GEMINI AI ---
+def setup_gemini():
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("❌ CRITICAL: GEMINI_API_KEY not found in secrets!")
+        return None
+    genai.configure(api_key=api_key)
+    # Using 'gemini-1.5-flash' because it is fast, cheap/free, and smart enough
+    return genai.GenerativeModel('gemini-1.5-flash')
+
 # --- AUTHENTICATION ---
 def get_sheet_data():
-    print("🔑 Authenticating with Google...")
+    print("🔑 Authenticating with Google Sheets...")
     if not os.path.exists(JSON_KEYFILE):
         print("❌ CRITICAL: service_account.json file not found!")
         return None
@@ -27,9 +37,8 @@ def get_sheet_data():
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_file(JSON_KEYFILE, scopes=scopes)
         client = gspread.authorize(creds)
-        print(f"📂 Opening Sheet: '{SHEET_NAME}'...")
         sheet = client.open(SHEET_NAME).sheet1
-        print("✅ Connection Successful!")
+        print("✅ Sheet Connection Successful!")
         return sheet
     except Exception as e:
         print("❌ Connection Failed.")
@@ -47,203 +56,114 @@ def get_driver():
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=chrome_options)
 
-# --- SCROLL HELPER ---
-def scroll_to_bottom(driver):
-    print("   Scrolling page to load lazy elements...")
+# --- HELPER: Scroll & Extract Text ---
+def get_page_content(driver, url):
+    print(f"   Navigating to {url}...")
+    driver.get(url)
+    time.sleep(5) # Let initial load happen
+    
+    print("   Scrolling to load all offers...")
     last_height = driver.execute_script("return document.body.scrollHeight")
-    for i in range(5):
+    for i in range(5): # Scroll 5 times
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(3)
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height: break
         last_height = new_height
-
-# --- SMART PARSER ---
-def parse_offer_text(text_block):
-    lines = [line.strip() for line in text_block.split('\n') if line.strip()]
-    
-    name = "Unknown Bundle"
-    price = "N/A"
-    details = []
-    validity = "N/A"
-
-    # Regex patterns
-    price_pattern = re.compile(r'(Rs\.|PKR|Consumer Price|Incl\. Tax)', re.IGNORECASE)
-    data_pattern = re.compile(r'(\d+\s*(GB|MB))', re.IGNORECASE)
-    mins_pattern = re.compile(r'(\d+\s*Mins)', re.IGNORECASE)
-    sms_pattern = re.compile(r'(\d+\s*SMS)', re.IGNORECASE)
-    
-    # 1. Extract Price
-    for i, line in enumerate(lines):
-        if price_pattern.search(line):
-            price_match = re.search(r'[\d,]+', line)
-            if price_match:
-                price = price_match.group(0)
-            else:
-                price = line
-            lines.pop(i) 
-            break
-            
-    # 2. Extract Details & Validity
-    filtered_lines = []
-    for line in lines:
-        is_detail = False
-        if data_pattern.search(line):
-            details.append(line)
-            is_detail = True
-        if mins_pattern.search(line):
-            details.append(line)
-            is_detail = True
-        if sms_pattern.search(line):
-            details.append(line)
-            is_detail = True
         
-        # Validity Guessing
-        lower_line = line.lower()
-        if "weekly" in lower_line: validity = "Weekly"
-        elif "monthly" in lower_line: validity = "Monthly"
-        elif "daily" in lower_line: validity = "Daily"
-        elif "3 day" in lower_line: validity = "3 Days"
+    # Get the visible text of the body. This is what humans see.
+    body_text = driver.find_element(By.TAG_NAME, "body").text
+    return body_text
 
-        if not is_detail:
-            filtered_lines.append(line)
-
-    # 3. Name Extraction (First valid line remaining)
-    for line in filtered_lines:
-        # Ignore common button texts
-        if len(line) > 3 and "subscribe" not in line.lower() and "consumer price" not in line.lower():
-            name = line
-            break
-            
-    full_details = ", ".join(details) if details else "Check Site"
-    return name, validity, full_details, price
-
-# --- SCRAPERS ---
-
-def scrape_zong(driver):
-    print("🔹 Scraping Zong...")
-    driver.get("https://www.zong.com.pk/prepaid")
-    time.sleep(5)
-    scroll_to_bottom(driver) # Added scrolling for Zong!
+# --- AI PARSER ---
+def parse_with_gemini(model, operator_name, raw_text):
+    print(f"🤖 Asking Gemini to extract {operator_name} offers...")
     
-    offers = []
+    # The Prompt: We teach Gemini exactly how to format the data
+    prompt = f"""
+    You are a data extraction bot. I will give you the raw text from the {operator_name} website.
+    Your job is to find all the Telecom Bundles/Offers in the text.
+    
+    Rules:
+    1. Extract: Offer Name, Price (include Currency), Details (Data, Mins, SMS), and Validity.
+    2. Validity: If not explicitly stated, infer it from the name (e.g., "Weekly" = "Weekly").
+    3. Output strictly as a JSON list of objects.
+    4. Format: [{{"name": "...", "price": "...", "validity": "...", "details": "..."}}, ...]
+    5. Do not add markdown formatting (like ```json). Just the raw JSON string.
+    
+    Here is the raw text:
+    {raw_text[:30000]}  # Limit text to avoid token limits, though 1.5 Flash handles huge context
+    """
+    
     try:
-        # Simplified Zong Selector
-        cards = driver.find_elements(By.XPATH, "//*[contains(text(), 'Consumer Price')]/../../..")
-        
-        for card in cards:
-            try:
-                name, validity, details, price = parse_offer_text(card.text)
-                if name != "Unknown Bundle":
-                    offers.append(["Zong", name, validity, details, price])
-            except: continue
+        response = model.generate_content(prompt)
+        # Clean response (sometimes AI adds ```json at start)
+        cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(cleaned_text)
+        print(f"   ✅ Gemini found {len(data)} offers.")
+        return data
     except Exception as e:
-        print(f"   Zong Error: {e}")
-        
-    print(f"   ✅ Found {len(offers)} Zong offers.")
-    return offers
+        print(f"   ❌ Gemini Error: {e}")
+        return []
 
-def scrape_jazz(driver):
-    print("🔹 Scraping Jazz...")
-    driver.get("https://jazz.com.pk/prepaid/all-in-one-offers")
-    time.sleep(5)
-    scroll_to_bottom(driver)
-    
-    offers = []
-    try:
-        # FIXED JAZZ SELECTOR: Uses '.' to check current node and children text
-        # Checks for "SUBSCRIBE" or "MORE DETAILS"
-        xpath = "//button[contains(., 'SUBSCRIBE') or contains(., 'Subscribe') or contains(., 'MORE DETAILS') or contains(., 'More Details')]/../../.."
-        cards = driver.find_elements(By.XPATH, xpath)
-        
-        # Fallback if buttons aren't found, look for Prices
-        if len(cards) == 0:
-            print("   Using fallback selector for Jazz...")
-            cards = driver.find_elements(By.XPATH, "//*[contains(text(), 'Rs.')]/../../..")
-
-        for card in cards:
-            try:
-                name, validity, details, price = parse_offer_text(card.text)
-                
-                # Validity Fallback
-                if validity == "N/A":
-                    lower_name = name.lower()
-                    if "weekly" in lower_name: validity = "Weekly"
-                    elif "monthly" in lower_name: validity = "Monthly"
-                    elif "daily" in lower_name: validity = "Daily"
-
-                offers.append(["Jazz", name, validity, details, price])
-            except: continue
-    except Exception as e:
-        print(f"   Jazz Error: {e}")
-        
-    print(f"   ✅ Found {len(offers)} Jazz offers.")
-    return offers
-
-# --- PROCESSING ---
-def process_data(new_data, sheet):
-    if not sheet: return []
-    
-    existing_records = sheet.get_all_records()
-    df_old = pd.DataFrame(existing_records)
-    
-    processed_rows = []
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    for row in new_data:
-        operator, name, validity, details, price = row
-        remark = "New Offer"
-        
-        if not df_old.empty and 'Offer Name' in df_old.columns:
-            match = df_old[(df_old['Operator'] == operator) & (df_old['Offer Name'] == name)]
-            
-            if not match.empty:
-                last_entry = match.iloc[-1]
-                last_price = str(last_entry['Price']).strip()
-                last_details = str(last_entry['Details']).strip()
-                
-                price_changed = last_price != str(price).strip()
-                details_changed = last_details != str(details).strip()
-                
-                if not price_changed:
-                    remark = "Same as yesterday"
-                else:
-                    changes = []
-                    if price_changed: changes.append(f"Price: {last_price}->{price}")
-                    if details_changed: changes.append("Details Updated")
-                    remark = "Changed: " + ", ".join(changes)
-        
-        processed_rows.append([today, operator, name, validity, details, price, remark])
-    
-    return processed_rows
-
-# --- MAIN ---
+# --- MAIN EXECUTION ---
 def main():
-    print("--- STARTING BOT ---")
+    print("--- STARTING AI BOT ---")
+    
+    # 1. Setup
+    model = setup_gemini()
     sheet = get_sheet_data()
-    if not sheet: return
+    if not model or not sheet: return
 
     driver = get_driver()
-    all_offers = []
+    all_rows = []
+    today = datetime.now().strftime("%Y-%m-%d")
     
-    try: all_offers.extend(scrape_zong(driver))
-    except Exception as e: print(f"Global Zong Fail: {e}")
+    # 2. Define Sites to Scrape
+    # Add more sites here easily!
+    sites = [
+        {"name": "Zong", "url": "https://www.zong.com.pk/prepaid"},
+        {"name": "Jazz", "url": "https://jazz.com.pk/prepaid/all-in-one-offers"},
+        {"name": "Telenor", "url": "https://www.telenor.com.pk/personal/telenor/offers/"},
+    ]
 
-    try: all_offers.extend(scrape_jazz(driver))
-    except Exception as e: print(f"Global Jazz Fail: {e}")
-    
+    # 3. Loop through sites
+    for site in sites:
+        try:
+            print(f"🔹 Processing {site['name']}...")
+            raw_text = get_page_content(driver, site['url'])
+            
+            # Send to AI
+            offers = parse_with_gemini(model, site['name'], raw_text)
+            
+            # Format for Sheets
+            for offer in offers:
+                # Add "New Offer" logic here if you want (simplified for now)
+                all_rows.append([
+                    today,
+                    site['name'],
+                    offer.get('name', 'N/A'),
+                    offer.get('validity', 'N/A'),
+                    offer.get('details', 'N/A'),
+                    offer.get('price', 'N/A'),
+                    "AI Extracted" 
+                ])
+                
+        except Exception as e:
+            print(f"   ❌ Failed to process {site['name']}: {e}")
+
     driver.quit()
     
-    if all_offers:
-        print(f"📝 Writing {len(all_offers)} rows to Google Sheets...")
+    # 4. Save
+    if all_rows:
+        print(f"📝 Writing {len(all_rows)} rows to Google Sheets...")
         try:
-            final_rows = process_data(all_offers, sheet)
-            sheet.append_rows(final_rows)
-            print("🎉 SUCCESS: Data written to sheet.")
+            sheet.append_rows(all_rows)
+            print("🎉 SUCCESS: Data written.")
         except Exception as e:
             print(f"❌ Error writing to sheet: {e}")
     else:
-        print("⚠️ Scrapers finished but found 0 offers.")
+        print("⚠️ No data found.")
 
 if __name__ == "__main__":
     main()
