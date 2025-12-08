@@ -1,8 +1,9 @@
 import time
 import json
+import os
 import pandas as pd
 import gspread
-from google.oauth2.service_account import Credentials
+import traceback
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -14,24 +15,34 @@ from datetime import datetime
 SHEET_NAME = "Telecom_Offers_Bot"  
 JSON_KEYFILE = "service_account.json"
 
-# --- NEW AUTHENTICATION (Fixes <Response 200> Error) ---
+# --- AUTHENTICATION ---
 def get_sheet_data():
-    try:
-        # Define the scope explicitly
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
+    print("🔑 Authenticating with Google...")
+    
+    # Check if JSON file exists
+    if not os.path.exists(JSON_KEYFILE):
+        print("❌ CRITICAL: service_account.json file not found!")
+        return None
         
-        # Load credentials using the modern library
-        creds = Credentials.from_service_account_file(JSON_KEYFILE, scopes=scopes)
-        client = gspread.authorize(creds)
+    try:
+        # The 'service_account' method handles scopes and tokens automatically
+        gc = gspread.service_account(filename=JSON_KEYFILE)
         
         # Open the sheet
-        sheet = client.open(SHEET_NAME).sheet1
+        print(f"📂 Opening Sheet: '{SHEET_NAME}'...")
+        sheet = gc.open(SHEET_NAME).sheet1
+        print("✅ Connection Successful!")
         return sheet
+    except gspread.exceptions.SpreadsheetNotFound:
+        print(f"❌ ERROR: Spreadsheet '{SHEET_NAME}' not found.")
+        print("   -> Make sure you shared the sheet with the 'client_email' inside your JSON file.")
+        print("   -> Make sure the Sheet Name in this code matches your actual Google Sheet Name exactly.")
+        return None
     except Exception as e:
-        print(f"❌ Connection Critical Error: {e}")
+        print("❌ Connection Failed.")
+        print("-" * 30)
+        traceback.print_exc()  # This prints the REAL error details
+        print("-" * 30)
         return None
 
 # --- BROWSER SETUP ---
@@ -41,7 +52,6 @@ def get_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
-    # Use a real user-agent to avoid being blocked
     chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
     
     service = Service(ChromeDriverManager().install())
@@ -52,7 +62,7 @@ def get_driver():
 def scroll_to_bottom(driver):
     print("   Scrolling page...")
     last_height = driver.execute_script("return document.body.scrollHeight")
-    for i in range(5): # Scroll 5 times
+    for i in range(5):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
         new_height = driver.execute_script("return document.body.scrollHeight")
@@ -61,7 +71,6 @@ def scroll_to_bottom(driver):
         last_height = new_height
 
 # --- SCRAPERS ---
-
 def scrape_zong(driver):
     print("🔹 Scraping Zong...")
     driver.get("https://www.zong.com.pk/prepaid")
@@ -69,17 +78,17 @@ def scrape_zong(driver):
     
     offers = []
     try:
-        # Zong Strategy: Look for "Consumer Price" which is unique to their cards
+        # Strategy: Look for specific price format "PKR. 500.00 Consumer Price"
+        # We find elements with "Consumer Price" and work backwards
         price_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Consumer Price')]")
         
         for price_el in price_elements:
             try:
                 raw_price = price_el.text.replace("Consumer Price", "").strip()
-                # Go up 3 levels to find the card container
+                # Parent of Parent usually holds the whole card
                 card = price_el.find_element(By.XPATH, "./../../..")
                 text_lines = card.text.split('\n')
                 
-                # Name is usually the first non-empty line
                 name = text_lines[0]
                 validity = "Weekly" if "Weekly" in name else ("Monthly" if "Monthly" in name else "Daily")
                 
@@ -100,22 +109,18 @@ def scrape_jazz(driver):
     
     offers = []
     try:
-        # Jazz Strategy: Look for the "MORE DETAILS" or "SUBSCRIBE" buttons
-        # This is more reliable than looking for prices directly
+        # Strategy: Look for 'MORE DETAILS' buttons which are distinct to Jazz cards
         buttons = driver.find_elements(By.XPATH, "//*[contains(text(), 'MORE DETAILS') or contains(text(), 'SUBSCRIBE')]")
         
         for btn in buttons:
             try:
-                # The button is inside the card. We go up to the main container.
-                # Usually 2-3 levels up covers the whole offer box.
                 card = btn.find_element(By.XPATH, "./../../..") 
                 card_text = card.text
                 
-                # Extract Price: Look for "Rs." inside the card text
                 lines = card_text.split('\n')
-                price = "N/A"
-                name = lines[0] # First line is usually name
+                name = lines[0]
                 
+                price = "N/A"
                 for line in lines:
                     if "Rs." in line or "Incl. Tax" in line:
                         price = line.strip()
@@ -145,7 +150,6 @@ def process_data(new_data, sheet):
         operator, name, validity, details, price = row
         remark = "New Offer"
         
-        # Check duplicates
         if not df_old.empty and 'Offer Name' in df_old.columns:
             match = df_old[(df_old['Operator'] == operator) & (df_old['Offer Name'] == name)]
             if not match.empty:
@@ -163,13 +167,11 @@ def process_data(new_data, sheet):
 def main():
     print("--- STARTING BOT ---")
     
-    # 1. Connect to Sheet first
+    # 1. Connect first
     sheet = get_sheet_data()
     if not sheet:
-        print("❌ STOPPING: Could not connect to Google Sheet.")
-        return
+        return # Stop if auth fails
 
-    print("✅ Google Sheet Connection Successful.")
     driver = get_driver()
     all_offers = []
     
@@ -182,12 +184,15 @@ def main():
     
     driver.quit()
     
-    # 3. Save Data
+    # 3. Save
     if all_offers:
         print(f"📝 Writing {len(all_offers)} rows to Google Sheets...")
-        final_rows = process_data(all_offers, sheet)
-        sheet.append_rows(final_rows)
-        print("🎉 SUCCESS: Data written to sheet.")
+        try:
+            final_rows = process_data(all_offers, sheet)
+            sheet.append_rows(final_rows)
+            print("🎉 SUCCESS: Data written to sheet.")
+        except Exception as e:
+            print(f"❌ Error writing to sheet: {e}")
     else:
         print("⚠️ Scrapers finished but found 0 offers.")
 
