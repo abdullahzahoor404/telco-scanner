@@ -30,4 +30,6 @@ jobs:
           python -c "import os, json; f = open('service_account.json', 'w'); json.dump(json.loads(os.environ['GDRIVE_CREDS']), f)"
 
       - name: Run Scraper
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}  # <--- THIS IS NEW
         run: python main.py
