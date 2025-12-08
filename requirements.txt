@@ -1,6 +1,6 @@
 selenium
 gspread
-oauth2client
+google-auth
 pandas
 beautifulsoup4
 webdriver-manager
