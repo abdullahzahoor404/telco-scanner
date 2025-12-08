@@ -17,6 +17,8 @@ from datetime import datetime
 # --- CONFIGURATION ---
 SHEET_NAME = "Telecom_Offers_Bot"  
 JSON_KEYFILE = "service_account.json"
+# We use the specific model visible in your dashboard
+MODEL_NAME = 'gemini-2.5-flash' 
 
 # --- SETUP GEMINI AI ---
 def setup_gemini():
@@ -27,27 +29,8 @@ def setup_gemini():
     
     print("🔑 Configuring Gemini API...")
     genai.configure(api_key=api_key)
-    
-    # WE KNOW 'gemini-flash-latest' EXISTS from your previous logs.
-    # We force this model instead of guessing.
-    target_model = 'gemini-flash-latest'
-    
-    try:
-        # Double check if it's in the list just to be safe
-        available = [m.name for m in genai.list_models()]
-        print(f"🔎 Found {len(available)} models available.")
-        
-        # If the exact alias isn't there, look for any 'flash' model
-        if 'models/gemini-flash-latest' not in available:
-            for m in available:
-                if 'flash' in m and 'exp' not in m: # Prefer stable flash
-                    target_model = m
-                    break
-    except:
-        pass
-
-    print(f"👉 Force Selecting Model: {target_model}")
-    return genai.GenerativeModel(target_model)
+    print(f"👉 Force Selecting Model: {MODEL_NAME}")
+    return genai.GenerativeModel(MODEL_NAME)
 
 # --- AUTHENTICATION ---
 def get_sheet_data():
@@ -80,6 +63,7 @@ def get_driver():
 
 # --- HELPER: Scroll & Extract Text ---
 def get_page_content(driver, url):
+    # SAFETY: Clean URL
     clean_url = url.replace("[", "").replace("]", "").split("(")[0].strip()
     if clean_url.startswith("http") and ")" in url:
         clean_url = url.split("(")[-1].replace(")", "")
@@ -158,7 +142,7 @@ def parse_with_gemini(model, operator_name, raw_text):
                 if start != -1 and end != -1:
                     cleaned_text = cleaned_text[start:end+1]
                 else:
-                    # Retry if AI gave bad format
+                    print(f"   ⚠️ Bad JSON format from AI. Retrying...")
                     continue 
 
             data = json.loads(cleaned_text)
@@ -168,6 +152,8 @@ def parse_with_gemini(model, operator_name, raw_text):
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "Quota" in error_msg:
+                # YOUR LIMIT IS 5 RPM (1 request every 12 seconds).
+                # We wait 20 seconds to be safe.
                 print(f"   ⚠️ Quota Hit! Waiting 20s... ({attempt+1}/{max_retries})")
                 time.sleep(20)
             else:
@@ -196,13 +182,18 @@ def main():
         {"name": "Jazz", "url": "https://jazz.com.pk/prepaid/all-in-one-offers"},
     ]
 
-    for site in sites:
+    for i, site in enumerate(sites):
         try:
+            # SAFETY DELAY:
+            # Your account allows 5 requests per minute.
+            # We enforce a 15-second delay between every site scan.
+            if i > 0: 
+                print("   ⏳ Waiting 15s to respect API Rate Limits...")
+                time.sleep(15)
+
             print(f"🔹 Processing {site['name']}...")
             raw_text = get_page_content(driver, site['url'])
             
-            if len(all_rows) > 0: time.sleep(5)
-
             offers = parse_with_gemini(model, site['name'], raw_text)
             
             for offer in offers:
