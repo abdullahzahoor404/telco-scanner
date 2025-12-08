@@ -28,20 +28,42 @@ def setup_gemini():
     print("🔑 Configuring Gemini API...")
     genai.configure(api_key=api_key)
     
-    # 1. Select Model
-    model_name = 'gemini-1.5-flash' # Default stable model
+    # CHANGED: We now prioritize 1.5 Flash because it has the best Free Tier limits
+    priority_models = [
+        'gemini-1.5-flash',       # STABLE & FREE (Best choice)
+        'gemini-1.5-pro',         # Good fallback
+        'gemini-flash-latest',    
+        'gemini-pro'              
+    ]
     
-    # Check if we can find a better one
+    target_model_name = None
     try:
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                if 'gemini-1.5-flash' in m.name:
-                    model_name = m.name
+        print("🔎 Listing available models...")
+        # Get all models that support generating content
+        all_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        # Check priority list
+        for priority in priority_models:
+            for available in all_models:
+                if priority in available and "exp" not in available: # Avoid experimental models if possible
+                    target_model_name = available
                     break
-    except: pass
+            if target_model_name: break
+        
+        # Fallback
+        if not target_model_name and all_models:
+            target_model_name = all_models[0]
 
-    print(f"👉 Using Model: {model_name}")
-    return genai.GenerativeModel(model_name)
+        if target_model_name:
+            print(f"👉 Selected Model: {target_model_name}")
+            return genai.GenerativeModel(target_model_name)
+        else:
+            print("⚠️ Could not auto-detect. Forcing 'gemini-1.5-flash'...")
+            return genai.GenerativeModel('gemini-1.5-flash')
+            
+    except Exception as e:
+        print(f"❌ Error selecting model: {e}")
+        return genai.GenerativeModel('gemini-1.5-flash')
 
 # --- AUTHENTICATION ---
 def get_sheet_data():
@@ -74,6 +96,7 @@ def get_driver():
 
 # --- HELPER: Scroll & Extract Text ---
 def get_page_content(driver, url):
+    # SAFETY: Remove any markdown brackets
     clean_url = url.replace("[", "").replace("]", "").split("(")[0].strip()
     if clean_url.startswith("http") and ")" in url:
         clean_url = url.split("(")[-1].replace(")", "")
@@ -96,83 +119,43 @@ def get_page_content(driver, url):
     body_text = driver.find_element(By.TAG_NAME, "body").text
     return body_text
 
-# --- AI PARSER ---
+# --- AI PARSER (WITH RETRY LOGIC) ---
 def parse_with_gemini(model, operator_name, raw_text):
     print(f"🤖 Asking Gemini to extract {operator_name} offers...")
     
-    # DEBUG: Print length so we know if scraper worked
-    print(f"   (Input Text Length: {len(raw_text)} characters)")
-    
-    if len(raw_text) < 500:
-        print("   ⚠️ Text too short! Scraper might have been blocked or page is empty.")
-        return []
-
     prompt = f"""
-    I am giving you the raw text content of the {operator_name} website. 
-    Your task is to extracting a list of Telecom Bundles/Offers.
-
-    RAW TEXT STARTS HERE:
-    {raw_text[:40000]}
-    RAW TEXT ENDS HERE.
-
-    INSTRUCTIONS:
-    1. Look for patterns like "Monthly", "Weekly", "GB", "Mins", "Rs.", "PKR".
-    2. Extract: Offer Name, Price, Details (Data/Mins), Validity.
-    3. Return ONLY a JSON list. No markdown. No explanations.
-    4. If no offers are found, return exactly: []
+    You are a data extraction bot. I will give you the raw text from the {operator_name} website.
+    Your job is to find all the Telecom Bundles/Offers in the text.
     
-    JSON FORMAT EXAMPLE:
-    [
-        {{"name": "Super Weekly", "price": "Rs. 250", "validity": "Weekly", "details": "10GB Data"}},
-        {{"name": "Monthly Max", "price": "PKR 1000", "validity": "Monthly", "details": "20GB, 500 Mins"}}
-    ]
+    Rules:
+    1. Extract: Offer Name, Price (include Currency), Details (Data, Mins, SMS), and Validity.
+    2. Validity: If not explicitly stated, infer it from the name (e.g., "Weekly" = "Weekly").
+    3. Output strictly as a JSON list of objects.
+    4. Format: [{{"name": "...", "price": "...", "validity": "...", "details": "..."}}, ...]
+    5. Do not add markdown formatting (like ```json). Just the raw JSON string.
+    
+    Here is the raw text:
+    {raw_text[:30000]} 
     """
     
-    # SAFETY SETTINGS: Disable filters to prevent "Blocked" errors
-    safety_config = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-
+    # Retry Loop: Tries 3 times if Quota Exceeded
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = model.generate_content(prompt, safety_settings=safety_config)
-            
-            # SAFE TEXT EXTRACTION
-            try:
-                result_text = response.text
-            except Exception:
-                # If .text fails, it usually means the candidate was blocked or empty
-                print(f"   ⚠️ API returned no text (Finish Reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}).")
-                return []
-
-            cleaned_text = result_text.replace("```json", "").replace("```", "").strip()
-            
-            # Handle cases where AI returns plain text instead of JSON
-            if not cleaned_text.startswith("["):
-                # Try to find the list bracket
-                start = cleaned_text.find("[")
-                end = cleaned_text.rfind("]")
-                if start != -1 and end != -1:
-                    cleaned_text = cleaned_text[start:end+1]
-                else:
-                    print("   ⚠️ AI output was not valid JSON.")
-                    return []
-
+            response = model.generate_content(prompt)
+            cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
             data = json.loads(cleaned_text)
             print(f"   ✅ Gemini found {len(data)} offers.")
             return data
             
         except Exception as e:
             error_msg = str(e)
-            if "429" in error_msg or "Quota" in error_msg:
-                print(f"   ⚠️ Quota Hit! Waiting 20s... ({attempt+1}/{max_retries})")
-                time.sleep(20)
+            if "429" in error_msg or "Quota exceeded" in error_msg:
+                wait_time = 20 # Wait 20 seconds
+                print(f"   ⚠️ Quota Hit! Waiting {wait_time}s before retry ({attempt+1}/{max_retries})...")
+                time.sleep(wait_time)
             else:
-                print(f"   ❌ Parsing Error: {e}")
+                print(f"   ❌ Gemini Error: {e}")
                 return []
     
     return []
@@ -181,6 +164,7 @@ def parse_with_gemini(model, operator_name, raw_text):
 def main():
     print("--- STARTING AI BOT ---")
     
+    # 1. Setup
     model = setup_gemini()
     sheet = get_sheet_data()
     
@@ -193,8 +177,8 @@ def main():
     today = datetime.now().strftime("%Y-%m-%d")
     
     sites = [
-        {"name": "Zong", "url": "https://www.zong.com.pk/prepaid"},
-        {"name": "Jazz", "url": "https://jazz.com.pk/prepaid/all-in-one-offers"},
+        {"name": "Zong", "url": "[https://www.zong.com.pk/prepaid](https://www.zong.com.pk/prepaid)"},
+        {"name": "Jazz", "url": "[https://jazz.com.pk/prepaid/all-in-one-offers](https://jazz.com.pk/prepaid/all-in-one-offers)"},
     ]
 
     for site in sites:
@@ -202,8 +186,10 @@ def main():
             print(f"🔹 Processing {site['name']}...")
             raw_text = get_page_content(driver, site['url'])
             
-            # Pause to save quota
-            if len(all_rows) > 0: time.sleep(5)
+            # Helper to pause between sites to save quota
+            if len(all_rows) > 0: 
+                print("   Sleeping 10s to be safe...")
+                time.sleep(10)
 
             offers = parse_with_gemini(model, site['name'], raw_text)
             
