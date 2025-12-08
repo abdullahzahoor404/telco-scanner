@@ -2,5 +2,5 @@ selenium
 gspread
 google-auth
 pandas
-beautifulsoup4
 webdriver-manager
+google-generativeai
