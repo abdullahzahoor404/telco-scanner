@@ -25,7 +25,7 @@ def setup_gemini():
         return None
     genai.configure(api_key=api_key)
     # Using 'gemini-1.5-flash' because it is fast, cheap/free, and smart enough
-    return genai.GenerativeModel('gemini-1.5-flash')
+    return genai.GenerativeModel('gemini-pro')
 
 # --- AUTHENTICATION ---
 def get_sheet_data():
@@ -167,3 +167,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
