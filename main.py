@@ -1,7 +1,8 @@
 import time
+import json
 import pandas as pd
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -13,16 +14,24 @@ from datetime import datetime
 SHEET_NAME = "Telecom_Offers_Bot"  
 JSON_KEYFILE = "service_account.json"
 
-# --- GOOGLE SHEETS AUTH ---
+# --- NEW AUTHENTICATION (Fixes <Response 200> Error) ---
 def get_sheet_data():
     try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_KEYFILE, scope)
+        # Define the scope explicitly
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        
+        # Load credentials using the modern library
+        creds = Credentials.from_service_account_file(JSON_KEYFILE, scopes=scopes)
         client = gspread.authorize(creds)
+        
+        # Open the sheet
         sheet = client.open(SHEET_NAME).sheet1
         return sheet
     except Exception as e:
-        print(f"❌ Connection Error: {e}")
+        print(f"❌ Connection Critical Error: {e}")
         return None
 
 # --- BROWSER SETUP ---
@@ -32,7 +41,8 @@ def get_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36")
+    # Use a real user-agent to avoid being blocked
+    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
     
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
@@ -40,11 +50,11 @@ def get_driver():
 
 # --- SCROLL HELPER ---
 def scroll_to_bottom(driver):
-    print("   Scrolling page to load lazy elements...")
+    print("   Scrolling page...")
     last_height = driver.execute_script("return document.body.scrollHeight")
-    for i in range(3):
+    for i in range(5): # Scroll 5 times
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(3)
+        time.sleep(2)
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height:
             break
@@ -58,25 +68,19 @@ def scrape_zong(driver):
     time.sleep(5)
     
     offers = []
-    # Zong currently uses structure: "PKR. 2100.00 Consumer Price"
-    # We look for the container that holds this text
     try:
-        # Find all elements containing "Consumer Price"
+        # Zong Strategy: Look for "Consumer Price" which is unique to their cards
         price_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Consumer Price')]")
         
         for price_el in price_elements:
             try:
-                # The text usually looks like: "PKR. 550.00 Consumer Price"
                 raw_price = price_el.text.replace("Consumer Price", "").strip()
-                
-                # Go up 3-4 parents to find the whole card
+                # Go up 3 levels to find the card container
                 card = price_el.find_element(By.XPATH, "./../../..")
-                card_text = card.text.split('\n')
+                text_lines = card.text.split('\n')
                 
-                # Usually the first line of the card is the name
-                name = card_text[0]
-                if len(name) < 3: name = card_text[1] # Safety check
-                
+                # Name is usually the first non-empty line
+                name = text_lines[0]
                 validity = "Weekly" if "Weekly" in name else ("Monthly" if "Monthly" in name else "Daily")
                 
                 offers.append(["Zong", name, validity, "Check Site", raw_price])
@@ -85,7 +89,7 @@ def scrape_zong(driver):
     except Exception as e:
         print(f"   Zong Error: {e}")
         
-    print(f"   Found {len(offers)} Zong offers.")
+    print(f"   ✅ Found {len(offers)} Zong offers.")
     return offers
 
 def scrape_jazz(driver):
@@ -96,28 +100,35 @@ def scrape_jazz(driver):
     
     offers = []
     try:
-        # Jazz prices usually contain "Incl. Tax"
-        # We look for ANY element containing "Incl. Tax"
-        price_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Incl. Tax')]")
+        # Jazz Strategy: Look for the "MORE DETAILS" or "SUBSCRIBE" buttons
+        # This is more reliable than looking for prices directly
+        buttons = driver.find_elements(By.XPATH, "//*[contains(text(), 'MORE DETAILS') or contains(text(), 'SUBSCRIBE')]")
         
-        for price_el in price_elements:
+        for btn in buttons:
             try:
-                raw_price = price_el.text.strip()
+                # The button is inside the card. We go up to the main container.
+                # Usually 2-3 levels up covers the whole offer box.
+                card = btn.find_element(By.XPATH, "./../../..") 
+                card_text = card.text
                 
-                # Go up parents to find the wrapper
-                card = price_el.find_element(By.XPATH, "./../../..") 
+                # Extract Price: Look for "Rs." inside the card text
+                lines = card_text.split('\n')
+                price = "N/A"
+                name = lines[0] # First line is usually name
                 
-                # Jazz card text structure varies, but name is usually at top
-                text_lines = card.text.split('\n')
-                name = text_lines[0]
+                for line in lines:
+                    if "Rs." in line or "Incl. Tax" in line:
+                        price = line.strip()
+                        break
                 
-                offers.append(["Jazz", name, "N/A", "Check Site", raw_price])
+                if price != "N/A":
+                    offers.append(["Jazz", name, "N/A", "Check Site", price])
             except:
                 continue
     except Exception as e:
         print(f"   Jazz Error: {e}")
         
-    print(f"   Found {len(offers)} Jazz offers.")
+    print(f"   ✅ Found {len(offers)} Jazz offers.")
     return offers
 
 # --- PROCESSING ---
@@ -134,12 +145,12 @@ def process_data(new_data, sheet):
         operator, name, validity, details, price = row
         remark = "New Offer"
         
-        # Check against old data if it exists
+        # Check duplicates
         if not df_old.empty and 'Offer Name' in df_old.columns:
             match = df_old[(df_old['Operator'] == operator) & (df_old['Offer Name'] == name)]
             if not match.empty:
-                last_price = match.iloc[-1]['Price']
-                if str(last_price) == str(price):
+                last_price = str(match.iloc[-1]['Price']).strip()
+                if last_price == str(price).strip():
                     remark = "Same"
                 else:
                     remark = f"Changed: {last_price} -> {price}"
@@ -151,12 +162,18 @@ def process_data(new_data, sheet):
 # --- MAIN ---
 def main():
     print("--- STARTING BOT ---")
-    driver = get_driver()
-    sheet = get_sheet_data()
     
+    # 1. Connect to Sheet first
+    sheet = get_sheet_data()
+    if not sheet:
+        print("❌ STOPPING: Could not connect to Google Sheet.")
+        return
+
+    print("✅ Google Sheet Connection Successful.")
+    driver = get_driver()
     all_offers = []
     
-    # Run scrapers safely
+    # 2. Run Scrapers
     try: all_offers.extend(scrape_zong(driver))
     except Exception as e: print(f"Global Zong Fail: {e}")
 
@@ -165,13 +182,14 @@ def main():
     
     driver.quit()
     
-    if all_offers and sheet:
+    # 3. Save Data
+    if all_offers:
         print(f"📝 Writing {len(all_offers)} rows to Google Sheets...")
         final_rows = process_data(all_offers, sheet)
         sheet.append_rows(final_rows)
-        print("✅ SUCCESS: Data written.")
+        print("🎉 SUCCESS: Data written to sheet.")
     else:
-        print("⚠️ No data found or Sheet missing.")
+        print("⚠️ Scrapers finished but found 0 offers.")
 
 if __name__ == "__main__":
     main()
