@@ -17,7 +17,6 @@ from datetime import datetime
 # --- CONFIGURATION ---
 SHEET_NAME = "Telecom_Offers_Bot"  
 JSON_KEYFILE = "service_account.json"
-# We use the specific model visible in your dashboard
 MODEL_NAME = 'gemini-2.5-flash' 
 
 # --- SETUP GEMINI AI ---
@@ -62,7 +61,7 @@ def get_driver():
     return webdriver.Chrome(service=service, options=chrome_options)
 
 # --- HELPER: Scroll & Extract Text ---
-def get_page_content(driver, url):
+def get_page_content(driver, url, site_name="Site"):
     # SAFETY: Clean URL
     clean_url = url.replace("[", "").replace("]", "").split("(")[0].strip()
     if clean_url.startswith("http") and ")" in url:
@@ -72,18 +71,34 @@ def get_page_content(driver, url):
 
     print(f"   Navigating to: {clean_url}")
     driver.get(clean_url)
-    time.sleep(5) 
+    
+    # DYNAMIC WAIT TIMES
+    if "jazz" in clean_url:
+        wait_time = 30 # 30s specifically for Jazz
+    elif "ufone" in clean_url:
+        wait_time = 10 # Ufone can be a bit slow
+    else:
+        wait_time = 7  # Standard for Zong/Telenor
+        
+    print(f"   ⏳ Waiting {wait_time}s for page to fully load...")
+    time.sleep(wait_time) 
     
     print("   Scrolling to load all offers...")
     last_height = driver.execute_script("return document.body.scrollHeight")
-    for i in range(5):
+    # Scroll deeper (7 times) to ensure all lazy content loads
+    for i in range(7):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+        time.sleep(3) 
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height: break
         last_height = new_height
         
     body_text = driver.find_element(By.TAG_NAME, "body").text
+    
+    # DEBUG: Show us what the bot sees
+    preview = body_text[:100].replace('\n', ' ')
+    print(f"   👀 Bot sees: {preview}...")
+    
     return body_text
 
 # --- AI PARSER ---
@@ -99,11 +114,11 @@ def parse_with_gemini(model, operator_name, raw_text):
     Your task is to extracting a list of Telecom Bundles/Offers.
 
     RAW TEXT STARTS HERE:
-    {raw_text[:40000]}
+    {raw_text[:50000]}
     RAW TEXT ENDS HERE.
 
     INSTRUCTIONS:
-    1. Look for patterns like "Monthly", "Weekly", "GB", "Mins", "Rs.", "PKR".
+    1. Look for patterns like "Monthly", "Weekly", "GB", "Mins", "Rs.", "PKR", "Load", "Balance".
     2. Extract: Offer Name, Price, Details (Data/Mins), Validity.
     3. Return ONLY a JSON list. No markdown. No explanations.
     4. If no offers are found, return exactly: []
@@ -115,7 +130,6 @@ def parse_with_gemini(model, operator_name, raw_text):
     ]
     """
     
-    # SAFETY SETTINGS: Disable filters to prevent "Blocked" errors
     safety_config = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -131,7 +145,7 @@ def parse_with_gemini(model, operator_name, raw_text):
             try:
                 result_text = response.text
             except Exception:
-                print(f"   ⚠️ API returned no text (Finish Reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}).")
+                print(f"   ⚠️ API returned no text. Finish Reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}")
                 return []
 
             cleaned_text = result_text.replace("```json", "").replace("```", "").strip()
@@ -152,8 +166,6 @@ def parse_with_gemini(model, operator_name, raw_text):
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "Quota" in error_msg:
-                # YOUR LIMIT IS 5 RPM (1 request every 12 seconds).
-                # We wait 20 seconds to be safe.
                 print(f"   ⚠️ Quota Hit! Waiting 20s... ({attempt+1}/{max_retries})")
                 time.sleep(20)
             else:
@@ -180,19 +192,19 @@ def main():
     sites = [
         {"name": "Zong", "url": "https://www.zong.com.pk/prepaid"},
         {"name": "Jazz", "url": "https://jazz.com.pk/prepaid/all-in-one-offers"},
+        {"name": "Telenor", "url": "https://www.telenor.com.pk/personal/telenor/offers/"},
+        {"name": "Ufone", "url": "https://www.ufone.com/prepaid/"}
     ]
 
     for i, site in enumerate(sites):
         try:
-            # SAFETY DELAY:
-            # Your account allows 5 requests per minute.
-            # We enforce a 15-second delay between every site scan.
+            # SAFETY DELAY (15s between sites)
             if i > 0: 
                 print("   ⏳ Waiting 15s to respect API Rate Limits...")
                 time.sleep(15)
 
             print(f"🔹 Processing {site['name']}...")
-            raw_text = get_page_content(driver, site['url'])
+            raw_text = get_page_content(driver, site['url'], site['name'])
             
             offers = parse_with_gemini(model, site['name'], raw_text)
             
