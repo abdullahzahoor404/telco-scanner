@@ -1,6 +1,7 @@
 import time
 import json
 import os
+import re
 import pandas as pd
 import gspread
 import traceback
@@ -17,7 +18,7 @@ from datetime import datetime
 SHEET_NAME = "Telecom_Offers_Bot"  
 JSON_KEYFILE = "service_account.json"
 
-# --- SETUP GEMINI AI (SMART SELECTOR) ---
+# --- SETUP GEMINI AI (UPDATED FOR YOUR MODELS) ---
 def setup_gemini():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -27,31 +28,44 @@ def setup_gemini():
     print("🔑 Configuring Gemini API...")
     genai.configure(api_key=api_key)
     
-    # Dynamic Model Selection: Ask Google what is available
+    # 1. We prioritize the models we SAW in your logs
+    priority_models = [
+        'gemini-2.0-flash',       # Newest & Fastest
+        'gemini-flash-latest',    # Always valid
+        'gemini-1.5-flash',       # Fallback
+        'gemini-pro'              # Old Reliable
+    ]
+    
     target_model_name = None
     try:
-        print("🔎 Listing available models for your Key...")
-        for m in genai.list_models():
-            # We only care about models that can 'generateContent'
-            if 'generateContent' in m.supported_generation_methods:
-                print(f"   - Available: {m.name}")
-                # Prefer Flash (faster/free), then Pro
-                if 'gemini-1.5-flash' in m.name:
-                    target_model_name = m.name
-                elif 'gemini-1.5-pro' in m.name and not target_model_name:
-                    target_model_name = m.name
+        print("🔎 Listing available models...")
+        available_models = [m.name for m in genai.list_models()]
         
+        # Check for our priority models first
+        for priority in priority_models:
+            for available in available_models:
+                if priority in available:
+                    target_model_name = available
+                    break
+            if target_model_name: break
+        
+        # If we still don't have one, just grab the first "generateContent" model
+        if not target_model_name:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    target_model_name = m.name
+                    break
+
         if target_model_name:
-            print(f"👉 Automatically selected: {target_model_name}")
+            print(f"👉 Selected Model: {target_model_name}")
             return genai.GenerativeModel(target_model_name)
         else:
-            # Fallback if list fails but key works
-            print("⚠️ Could not auto-detect, forcing 'gemini-1.5-flash'...")
-            return genai.GenerativeModel('gemini-1.5-flash')
+            print("⚠️ Could not auto-detect. Forcing 'gemini-2.0-flash'...")
+            return genai.GenerativeModel('gemini-2.0-flash')
             
     except Exception as e:
-        print(f"❌ Error listing models: {e}")
-        return None
+        print(f"❌ Error selecting model: {e}")
+        return genai.GenerativeModel('gemini-2.0-flash')
 
 # --- AUTHENTICATION ---
 def get_sheet_data():
@@ -78,21 +92,32 @@ def get_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
+    # Using a generic User-Agent to avoid detection
+    chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=chrome_options)
 
 # --- HELPER: Scroll & Extract Text ---
 def get_page_content(driver, url):
-    print(f"   Navigating to {url}...")
-    driver.get(url)
+    # SAFETY: Remove any markdown brackets if they exist
+    clean_url = url.replace("[", "").replace("]", "").split("(")[0].strip()
+    if clean_url.startswith("http") and ")" in url:
+        # Fix specific markdown case [url](url) -> url
+        clean_url = url.split("(")[-1].replace(")", "")
+    
+    # If the regex above failed, just force the raw string if it looks like a url
+    if not clean_url.startswith("http"):
+        clean_url = url.strip()
+
+    print(f"   Navigating to: {clean_url}")
+    driver.get(clean_url)
     time.sleep(5) 
     
     print("   Scrolling to load all offers...")
     last_height = driver.execute_script("return document.body.scrollHeight")
     for i in range(5):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(3)
+        time.sleep(2)
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height: break
         last_height = new_height
@@ -137,12 +162,8 @@ def main():
     model = setup_gemini()
     sheet = get_sheet_data()
     
-    # If model failed (key error) or sheet failed, stop.
-    if not model: 
-        print("❌ STOPPING: Gemini Model could not be loaded.")
-        return
-    if not sheet: 
-        print("❌ STOPPING: Google Sheet could not be loaded.")
+    if not model or not sheet: 
+        print("❌ STOPPING: Setup failed.")
         return
 
     driver = get_driver()
@@ -150,6 +171,7 @@ def main():
     today = datetime.now().strftime("%Y-%m-%d")
     
     # 2. Define Sites to Scrape
+    # (I have ensured these are plain strings now)
     sites = [
         {"name": "Zong", "url": "[https://www.zong.com.pk/prepaid](https://www.zong.com.pk/prepaid)"},
         {"name": "Jazz", "url": "[https://jazz.com.pk/prepaid/all-in-one-offers](https://jazz.com.pk/prepaid/all-in-one-offers)"},
